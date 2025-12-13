@@ -10,21 +10,60 @@ def _normalize_and_scale(
     """Apply optional scaling/normalization."""
     traffic = traffic.astype(float)
 
-    # Optional pre-normalization scaling to a target sum or mean
+    eps = 1e-8
+
+    # --------------------------------------------------
+    # 1) 전체 합/평균 기준 스케일링 (기존 기능)
+    # --------------------------------------------------
     target_sum = params.get("target_sum")
     target_mean = params.get("target_mean")
-    eps = 1e-8
+
     if target_sum is not None and traffic.sum() > eps:
         traffic = traffic * (float(target_sum) / (traffic.sum() + eps))
+
     if target_mean is not None and traffic.mean() > eps:
         traffic = traffic * (float(target_mean) / (traffic.mean() + eps))
 
-    # Normalize to [0, 1] unless disabled
+    # --------------------------------------------------
+    # 2) [0, 1] 정규화 (옵션)
+    #    - shape를 0~1 범위로 만들고 싶을 때 사용
+    # --------------------------------------------------
     if params.get("normalize", True):
-        traffic = (traffic - traffic.min()) / (traffic.max() - traffic.min() + eps)
+        t_min = traffic.min()
+        t_max = traffic.max()
+        if t_max - t_min > eps:
+            traffic = (traffic - t_min) / (t_max - t_min + eps)
+        else:
+            traffic = np.zeros_like(traffic)
 
     if params.get("clip_0_1", True):
         traffic = np.clip(traffic, 0.0, 1.0)
+
+    # --------------------------------------------------
+    # 3) 임의 절대 값 범위로 스케일링 (NEW)
+    #    - abs_min, abs_max를 주면 해당 범위의 "절대 트래픽"으로 변환
+    #    - 예: abs_min=100, abs_max=500  => [100, 500] Mbps 범위
+    # --------------------------------------------------
+    abs_min = params.get("abs_min")
+    abs_max = params.get("abs_max")
+
+    if abs_min is not None or abs_max is not None:
+        cur_min = float(traffic.min())
+        cur_max = float(traffic.max())
+
+        # 하나만 주면 나머지는 현재 min/max를 그대로 사용
+        if abs_min is None:
+            abs_min = cur_min
+        if abs_max is None:
+            abs_max = cur_max
+
+        if cur_max - cur_min > eps:
+            norm = (traffic - cur_min) / (cur_max - cur_min + eps)
+        else:
+            norm = np.zeros_like(traffic)
+
+        traffic = abs_min + norm * (abs_max - abs_min)
+
     return traffic
 
 
@@ -175,6 +214,14 @@ def generate_synthetic_traffic(
 
     raise ValueError(f"Unknown pattern: {pattern}")
 
+def generate_random_mask(width: int, height: int, block_prob: float = 0.1, rng: np.random.Generator | None = None) -> np.ndarray:
+    """
+    설치 불가 지역을 표시하는 랜덤 마스크 생성 (True/1 == 설치 불가).
+    """
+    rng = rng or np.random.default_rng()
+    mask = rng.random((height, width)) < block_prob
+    return mask
+
 if __name__ == "__main__":
     # quick visualization test (saved to disk instead of plt.show for headless use)
     import matplotlib.pyplot as plt
@@ -191,11 +238,13 @@ if __name__ == "__main__":
         ("random_clusters", {"n_clusters": 6, "sigma": 3.0}),
     ]
     for name, p in demo_patterns:
+        p["abs_min"] = 0.0
+        p["abs_max"] = 200.0
         traffic_map = generate_synthetic_traffic(50, 50, pattern=name, rng=rng, params=p)
         plt.figure(figsize=(16, 16))
         plt.imshow(traffic_map, origin="lower")
         plt.title(f"pattern={name}")
         plt.colorbar(label="Traffic")
         plt.tight_layout()
-        plt.savefig(f"../tests/outputs/traffic_sample_{name}.png")
+        plt.savefig(f"traffic_sample_{name}.png")
         plt.close()

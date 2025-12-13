@@ -1,185 +1,243 @@
-# algos/tabu_search.py
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Tuple, List, Dict
+from typing import Callable, List, Tuple, Dict, Any
 import numpy as np
 
-from algos.base import Solver, SolverResult
+from core.base import Objective, State, Algorithm
 
-
-@dataclass
-class TabuParams:
-    tenure: int = 10              # Tabu 리스트에 머무르는 기간
-    n_candidates: int = 30        # 한 iteration에 평가할 neighbor 개수
-    max_no_improve: int = 100     # 개선이 없는 iteration이 이만큼 쌓이면 중단
-
-
-class TabuSearchSolver(Solver):
+class BitwiseTabuSearch(Algorithm):
     """
-    간단한 Tabu Search 구현
-    - move를 (bs_index, new_x, new_y)로 정의
-    - 최근 사용된 move를 Tabu 리스트에 저장하고, 그 move는 일정 기간 동안 사용 불가
-    - Aspiration: Tabu move라도 글로벌 베스트보다 개선되면 허용
+    비트 벡터(0/1) 기반 Tabu Search
+    - state: np.ndarray[int] (shape = (num_bits,), 값은 0 또는 1)
+    - neighbor 연산:
+        * flip: 임의의 index 하나를 0<->1 토글
+        * swap: 한 개의 1을 0으로, 한 개의 0을 1로 (1↔0 교환)
+    - move 표현:
+        * ('flip', idx)
+        * ('swap', idx_off, idx_on)  # idx_off: 1->0, idx_on: 0->1
     """
 
     def __init__(
         self,
-        problem,
+        objective: Objective,
         rng: np.random.Generator | None = None,
-        params: TabuParams | None = None,
+        max_bs: int = 25,
+        tenure: int = 10,
+        n_candidates: int = 30,
+        max_no_improve: int = 100,
+        p_flip: float = 0.5
     ):
-        super().__init__(problem, rng)
-        self.params = params or TabuParams()
+        """
+        Args:
+            num_bits: 비트 수 (즉, state 길이)
+            evaluate_fn: cost = evaluate_fn(state)
+            rng: numpy random generator (없으면 default_rng 사용)
+        """
+        super().__init__(objective, rng)
+        self.max_bs = max_bs
+        self.tenure = tenure
+        self.n_candidates = n_candidates
+        self.max_no_improve = max_no_improve
+        self.p_flip = p_flip
 
-    def _generate_neighbor_with_move(
-        self, state: np.ndarray
-    ) -> Tuple[np.ndarray, Tuple[int, int, int]]:
+    def _ensure_candidates(self, state: State, n_bs: int | None = None) -> "State":
         """
-        하나의 neighbor와 해당 move 정보를 생성
-        move: (idx, new_x, new_y)
+        state의 초기 상태를 기준으로 후보 위치 리스트 초기화
         """
+        if state.bs_layer.sum() > 0: # 이미 초기화되어 있음
+            return  
+        
+        if n_bs is None:
+            n_bs = self.max_bs
+        state.random_state(n_bs, "even")
+        return state
+    
+    def _init_state(self, state: State, n_bs: int | None = None) -> np.ndarray:
+        self._ensure_candidates(state= state, n_bs=n_bs)
+        if n_bs is None:
+            # 완전 랜덤
+            state = self.rng.integers(0, 2, size=self.num_bits, dtype=int)
+        else:
+            # 정확히 n_ones개의 1을 가지는 상태
+            state = np.zeros(self.num_bits, dtype=int)
+            n_bs = min(n_bs, self.num_bits)
+            idx = self.rng.choice(self.num_bits, size=n_bs, replace=False)
+            state[idx] = 1
+        return state
+    
+    def _get_neighbor(self, state: np.ndarray) -> State:
         s = state.copy()
-        n_bs = s.shape[0]
-        idx = self.rng.integers(0, n_bs)
 
-        # [-1, 0, +1] 이동
-        dx = self.rng.integers(-1, 2)
-        dy = self.rng.integers(-1, 2)
+        # flip vs swap 선택
+        if self.rng.random() < self.p_flip:
+            # === flip ===
+            idx = self.rng.integers(0, self.num_bits)
+            s[idx] = 1 - s[idx]
+            move = ("flip", int(idx))
+            return s, move
+        else:
+            # === swap ===
+            ones = np.where(s == 1)[0]
+            zeros = np.where(s == 0)[0]
 
-        new_x = int(np.clip(s[idx, 0] + dx, 0, self.problem.width - 1))
-        new_y = int(np.clip(s[idx, 1] + dy, 0, self.problem.height - 1))
+            # swap 불가능하면 fallback으로 flip
+            if len(ones) == 0 or len(zeros) == 0:
+                idx = self.rng.integers(0, self.num_bits)
+                s[idx] = 1 - s[idx]
+                move = ("flip", int(idx))
+                return s, move
 
-        s[idx, 0] = new_x
-        s[idx, 1] = new_y
+            idx_off = int(ones[self.rng.integers(0, len(ones))])
+            idx_on = int(zeros[self.rng.integers(0, len(zeros))])
 
-        move = (idx, new_x, new_y)
-        return s, move
+            s[idx_off] = 0
+            s[idx_on] = 1
+
+            # swap은 순서 무의미하니 정렬해서 항상 같은 표현으로 저장
+            move = ("swap", idx_off, idx_on)
+            return s, move
 
     def run(
         self,
         max_iter: int,
         init_state: np.ndarray | None = None,
         verbose: bool = False,
-    ) -> SolverResult:
-        problem = self.problem
+    ):
+        """
+        Args:
+            max_iter: 최대 iteration
+            init_state: 초기 상태 (없으면 랜덤 초기화)
+            verbose: 중간 로그 출력 여부
+        Returns:
+            best_state, best_cost, history (list[dict])
+        """
         p = self.params
+        rng = self.rng
 
+        # 초기 상태 설정
         if init_state is None:
-            current_state = problem.random_state()
+            current_state = self._init_state(self.max_bs)
         else:
-            current_state = problem.clamp_state(init_state)
+            current_state = np.asarray(init_state, dtype=int)
+            if current_state.shape[0] != self.num_bits:
+                raise ValueError("init_state length does not match num_bits")
 
-        current_cost, current_metrics = problem.evaluate(current_state)
+        current_cost = float(self.evaluate_fn(current_state))
         best_state = current_state.copy()
         best_cost = current_cost
-        best_metrics = current_metrics.copy()
 
-        # Tabu 리스트: move -> 남은 tenure
-        tabu_dict: Dict[Tuple[int, int, int], int] = {}
+        # Tabu 리스트: move(튜플) -> 남은 tenure
+        tabu_dict: Dict[Tuple[Any, ...], int] = {}
 
         history: List[dict] = []
         no_improve_count = 0
 
+        if verbose:
+            print(f"[TabuBit] start: cost={current_cost:.4f}")
+
         for it in range(max_iter):
             candidate_states: List[np.ndarray] = []
-            candidate_moves: List[Tuple[int, int, int]] = []
+            candidate_moves: List[Tuple[Any, ...]] = []
             candidate_costs: List[float] = []
-            candidate_metrics: List[dict] = []
 
-            # 여러 후보 neighbor 생성
+            # 1) 후보 neighbor 여러 개 생성
             for _ in range(p.n_candidates):
-                neighbor, move = self._generate_neighbor_with_move(current_state)
-
-                cost, metrics = problem.evaluate(neighbor)
-                candidate_states.append(neighbor)
+                neighbor_state, move = self._get_neighbor(current_state)
+                cost = float(self.evaluate_fn(neighbor_state))
+                candidate_states.append(neighbor_state)
                 candidate_moves.append(move)
                 candidate_costs.append(cost)
-                candidate_metrics.append(metrics)
 
-            # 후보 중에서 Tabu가 아닌(또는 Aspiration 조건 만족) 것 중 best 선택
+            # 2) Tabu + Aspiration 기준으로 best candidate 선택
             best_candidate_idx = None
             best_candidate_cost = float("inf")
-            best_candidate_metrics = None
-            best_candidate_state = None
-            best_candidate_move = None
 
-            for i, (state_i, move_i, cost_i, metrics_i) in enumerate(
-                zip(candidate_states, candidate_moves, candidate_costs, candidate_metrics)
-            ):
-                in_tabu = move_i in tabu_dict and tabu_dict[move_i] > 0
+            for idx, (move_i, cost_i) in enumerate(zip(candidate_moves, candidate_costs)):
+                in_tabu = (move_i in tabu_dict and tabu_dict[move_i] > 0)
 
-                # Aspiration 기준: Tabu더라도 글로벌 best보다 좋으면 허용
+                # Aspiration: Tabu라도 global best보다 좋으면 허용
                 if in_tabu and cost_i >= best_cost:
                     continue
 
                 if cost_i < best_candidate_cost:
                     best_candidate_cost = cost_i
-                    best_candidate_idx = i
-                    best_candidate_state = state_i
-                    best_candidate_metrics = metrics_i
-                    best_candidate_move = move_i
+                    best_candidate_idx = idx
 
+            # 만약 모두 Tabu여서 선택이 안 됐으면 그냥 최소 cost 선택
             if best_candidate_idx is None:
-                # 모든 후보가 Tabu인데 Aspiration도 못 만족 → 그래도 하나는 선택 (가장 좋은 것)
-                i = int(np.argmin(candidate_costs))
-                best_candidate_state = candidate_states[i]
-                best_candidate_cost = candidate_costs[i]
-                best_candidate_metrics = candidate_metrics[i]
-                best_candidate_move = candidate_moves[i]
+                best_candidate_idx = int(np.argmin(candidate_costs))
+                best_candidate_cost = candidate_costs[best_candidate_idx]
 
-            # 선택된 move를 적용
+            best_candidate_state = candidate_states[best_candidate_idx]
+            best_candidate_move = candidate_moves[best_candidate_idx]
+
+            # 3) 현재 상태 업데이트
             current_state = best_candidate_state
             current_cost = best_candidate_cost
-            current_metrics = best_candidate_metrics
 
-            # Tabu 리스트 업데이트 (tenure 초기화)
+            # 4) Tabu 리스트 갱신 (선택된 move를 Tabu에 등록)
             if best_candidate_move is not None:
                 tabu_dict[best_candidate_move] = p.tenure
 
-            # 글로벌 베스트 갱신
+            # 5) 글로벌 베스트 갱신
             if current_cost < best_cost:
-                best_state = current_state.copy()
                 best_cost = current_cost
-                best_metrics = current_metrics.copy()
+                best_state = current_state.copy()
                 no_improve_count = 0
             else:
                 no_improve_count += 1
 
-            # Tabu 남은 기간 감소
-            to_delete = []
-            for move, t in tabu_dict.items():
-                tabu_dict[move] = t - 1
-                if tabu_dict[move] <= 0:
-                    to_delete.append(move)
-            for move in to_delete:
-                del tabu_dict[move]
+            # 6) Tabu tenure 감소 및 만료 제거
+            expired = []
+            for m in tabu_dict:
+                tabu_dict[m] -= 1
+                if tabu_dict[m] <= 0:
+                    expired.append(m)
+            for m in expired:
+                del tabu_dict[m]
 
+            # 7) 기록
             history.append(
                 {
                     "iter": it,
                     "current_cost": float(current_cost),
                     "best_cost": float(best_cost),
-                    "current_coverage": float(current_metrics["coverage_ratio"]),
-                    "best_coverage": float(best_metrics["coverage_ratio"]),
                     "tabu_size": len(tabu_dict),
                 }
             )
 
             if verbose and (it % max(1, max_iter // 10) == 0):
                 print(
-                    f"[Tabu] iter={it:5d}, current_cost={current_cost:.4f}, "
-                    f"best_cost={best_cost:.4f}, best_cov={best_metrics['coverage_ratio']:.4f}, "
-                    f"tabu_size={len(tabu_dict)}"
+                    f"[TabuBit] iter={it:5d}, "
+                    f"current_cost={current_cost:.4f}, best_cost={best_cost:.4f}, "
+                    f"tabu_size={len(tabu_dict)}, no_improve={no_improve_count}"
                 )
 
+            # 8) 종료 조건
             if no_improve_count >= p.max_no_improve:
                 if verbose:
-                    print(f"[Tabu] Early stop: no improvement for {p.max_no_improve} iterations")
+                    print(f"[TabuBit] Early stop: no improvement for {p.max_no_improve} iterations")
                 break
 
-        return SolverResult(
-            best_state=best_state,
-            best_cost=float(best_cost),
-            best_metrics=best_metrics,
-            history=history,
-        )
+        return best_state, best_cost, history
+
+
+if __name__ == "__main__":
+    # 간단 실행 예시 (비트벡터 기반)
+    rng = np.random.default_rng(42)
+    from objectives import CoverageObjective
+    from base import State
+
+    # 50x50 랜덤 트래픽/마스크
+    init_state = State.from_shape(50, 50, rng=rng, traffic_params={"pattern": "multi_hotspot"})
+    # 목표 함수 (커버리지 전용)
+    objective = CoverageObjective(coverage_radius=4.0)
+
+    solver = BitwiseTabuSearch(objective=objective, rng=rng, max_bs=25, tenure=10, n_candidates=30, max_no_improve=50)
+
+    best_state, best_cost, history = solver.run(max_iter=300, init_state=None, verbose=True)
+
+    print("\n=== TabuSearch Result ===")
+    print(f"Best cost: {best_cost:.4f}")
+    # history 길이 확인
+    print(f"History length: {len(history)}")

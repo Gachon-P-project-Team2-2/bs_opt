@@ -6,6 +6,8 @@
 - Algorithm Solvers
 
 ## 사용 설명서
+현재 main.py는 동작하지 않고, 각 알고리즘 별로 실행 가능합니다.
+
 ### Traffic map generator
 ```
 cd core
